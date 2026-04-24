@@ -1,17 +1,20 @@
 """
 Evaluation metrics for Trajectory Influence Functions.
 
-Implements three evaluation protocols:
+Implements four evaluation protocols:
 
-1. TrajectoryLDS         -- Linear Datamodeling Score: Spearman correlation
-                            between predicted and actual influence via subset
-                            retraining.
-2. SafetyAttributionAUC  -- Area under ROC curve measuring whether influence
-                            scores correctly identify unsafe training data as
-                            responsible for constraint-violating plans.
-3. DataCurationEvaluator -- Evaluate attribution-guided data pruning: remove
-                            the most/least influential data and measure
-                            plan quality change.
+1. TrajectoryLDS                  -- Linear Datamodeling Score: Spearman
+                                     correlation between predicted and actual
+                                     influence via subset retraining.
+2. SafetyAttributionAUC           -- Area under ROC curve measuring whether
+                                     influence scores correctly identify unsafe
+                                     training data.
+3. DataCurationEvaluator          -- Evaluate attribution-guided data pruning
+                                     via proxy delta measurement.
+4. DownstreamInterventionEvaluator -- Validate influence scores via actual
+                                     downstream impact: remove data, retrain,
+                                     rollout in env, measure return and
+                                     constraint violations.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,6 +34,16 @@ from tqdm import tqdm
 from configs import EvaluationConfig, ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _try_acquire_lock(lock_path: str) -> bool:
+    """Atomically create lock file. Returns True if we got it."""
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +81,7 @@ class TrajectoryLDS:
         config: ExperimentConfig,
         eval_config: EvaluationConfig,
         proxy_fn_factory=None,
+        cache_dir: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -91,6 +106,66 @@ class TrajectoryLDS:
         self.config = config
         self.eval_config = eval_config
         self.proxy_fn_factory = proxy_fn_factory
+        self.cache_dir = cache_dir
+        if cache_dir is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+
+    def _cache_paths(self, k: int) -> Tuple[Optional[str], Optional[str]]:
+        if self.cache_dir is None:
+            return None, None
+        steps = self.eval_config.retrain_steps
+        seed = self.eval_config.base_seed
+        base = os.path.join(self.cache_dir, f"subset_{k:04d}_seed{seed}_steps{steps}")
+        return base + ".json", base + ".lock"
+
+    def _load_cached_proxy(self, k: int) -> Optional[float]:
+        cache_path, _ = self._cache_paths(k)
+        if cache_path is None or not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path) as f:
+                return float(json.load(f)["proxy_val"])
+        except (json.JSONDecodeError, KeyError, OSError):
+            return None
+
+    def _claim_subset(self, k: int) -> bool:
+        _, lock_path = self._cache_paths(k)
+        if lock_path is None:
+            return True
+        return _try_acquire_lock(lock_path)
+
+    def _release_lock(self, k: int) -> None:
+        _, lock_path = self._cache_paths(k)
+        if lock_path is None:
+            return
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+
+    def _save_cached_proxy(self, k: int, proxy_val: float) -> None:
+        cache_path, _ = self._cache_paths(k)
+        if cache_path is None:
+            return
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"proxy_val": proxy_val}, f)
+        os.replace(tmp, cache_path)
+
+    def _wait_for_cache(self, k: int, timeout: float = 7200.0) -> Optional[float]:
+        cache_path, lock_path = self._cache_paths(k)
+        if cache_path is None:
+            return None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if os.path.exists(cache_path):
+                return self._load_cached_proxy(k)
+            if not os.path.exists(lock_path):
+                # Worker died without writing; we should retry
+                return None
+            time.sleep(5.0)
+        logger.warning("Timeout waiting for subset %d cache.", k)
+        return None
 
     def compute_lds(
         self,
@@ -98,6 +173,7 @@ class TrajectoryLDS:
         full_model_proxy: Optional[float] = None,
         n_subsets: Optional[int] = None,
         subset_fraction: Optional[float] = None,
+        reverse: bool = False,
     ) -> Dict[str, float]:
         """Compute the Linear Datamodeling Score.
 
@@ -135,52 +211,71 @@ class TrajectoryLDS:
                 "Pass the actual value for meaningful LDS."
             )
 
-        actual_deltas = []
-        predicted_deltas = []
+        # Pre-generate all subsets deterministically so worker/main agree
+        # regardless of iteration direction.
         rng = np.random.RandomState(self.eval_config.base_seed)
+        subset_size = int(alpha * N)
+        all_subsets = [
+            rng.choice(N, size=subset_size, replace=False) for _ in range(n_sub)
+        ]
 
-        for k in tqdm(range(n_sub), desc="LDS subsets"):
-            # Sample subset indices
-            subset_size = int(alpha * N)
-            subset_indices = rng.choice(N, size=subset_size, replace=False)
-            subset_mask = np.zeros(N, dtype=bool)
-            subset_mask[subset_indices] = True
+        # proxy_vals indexed by k; None = not yet computed/loaded
+        proxy_vals: List[Optional[float]] = [None] * n_sub
 
-            # Create subset dataset
+        order = list(range(n_sub))
+        if reverse:
+            order = order[::-1]
+
+        for k in tqdm(order, desc="LDS subsets"):
+            subset_indices = all_subsets[k]
+
+            # Cache hit? (other process may have computed it)
+            cached = self._load_cached_proxy(k)
+            if cached is not None:
+                proxy_vals[k] = cached
+                continue
+
+            # Try to claim this subset via lock
+            if not self._claim_subset(k):
+                # Another process is computing; busy-wait for the cache file
+                proxy_vals[k] = self._wait_for_cache(k)
+                continue
+
+            # We hold the lock — retrain
             subset_dataset = _SubsetDataset(self.dataset, subset_indices)
-
-            # Override training steps for faster retraining
             retrain_config = _shallow_copy_config(self.config)
             retrain_config.diffuser.n_train_steps = self.eval_config.retrain_steps
 
-            # Retrain
             try:
                 retrained_model, _ = self.train_fn(
                     retrain_config, dataset=subset_dataset, verbose=False
                 )
-                # Generate plan from retrained model
                 plan = self.plan_fn(retrained_model, self.dataset, retrain_config)
-                # Evaluate proxy with the RETRAINED model (not original)
                 if self.proxy_fn_factory is not None:
                     retrained_proxy_fn = self.proxy_fn_factory(retrained_model)
                     proxy_val = retrained_proxy_fn(plan)
                 else:
                     proxy_val = self.proxy_fn(plan)
+                self._save_cached_proxy(k, float(proxy_val))
+                proxy_vals[k] = float(proxy_val)
             except Exception as e:
                 logger.warning("Subset %d failed: %s. Skipping.", k, e)
+            finally:
+                self._release_lock(k)
+
+        actual_deltas = []
+        predicted_deltas = []
+        for k in range(n_sub):
+            proxy_val = proxy_vals[k]
+            if proxy_val is None:
                 continue
-
-            # Actual change
-            delta_actual = proxy_val - full_model_proxy
-            actual_deltas.append(delta_actual)
-
-            # Predicted change from removing data:
-            # I(z_i) > 0 means z_i is helpful (removing it decreases proxy)
-            # So predicted delta = -sum of removed influences / N
-            # (negative because removing helpful data hurts)
+            subset_mask = np.zeros(N, dtype=bool)
+            subset_mask[all_subsets[k]] = True
+            actual_deltas.append(proxy_val - full_model_proxy)
             removed_mask = ~subset_mask
-            delta_predicted = -influence_scores[removed_mask].sum() / len(influence_scores)
-            predicted_deltas.append(delta_predicted)
+            predicted_deltas.append(
+                -influence_scores[removed_mask].sum() / len(influence_scores)
+            )
 
         actual_deltas = np.array(actual_deltas)
         predicted_deltas = np.array(predicted_deltas)
@@ -553,6 +648,201 @@ def _shallow_copy_config(config: ExperimentConfig) -> ExperimentConfig:
     with modified hyperparameters."""
     import copy
     return copy.deepcopy(config)
+
+
+# ---------------------------------------------------------------------------
+# Downstream Intervention Evaluator
+# ---------------------------------------------------------------------------
+
+
+class DownstreamInterventionEvaluator:
+    """Validate influence scores via actual downstream impact.
+
+    Protocol for each prune fraction K%:
+      1. Remove top-K% most influential (harmful) training data.
+      2. Retrain the diffusion model on the remaining data.
+      3. Rollout the retrained model in the actual Gym environment.
+      4. Measure: mean episodic return + constraint violation rate.
+      5. Repeat for bottom-K% (helpful) and random-K% removals.
+
+    This closes the gap between proxy-based evaluation and real-world
+    downstream impact, as requested by reviewers.
+    """
+
+    def __init__(
+        self,
+        train_fn,
+        plan_fn,
+        dataset,
+        config: ExperimentConfig,
+        model,
+    ) -> None:
+        """
+        Args:
+            train_fn: callable(config, dataset, verbose) -> (model, dataset).
+            plan_fn: callable(model, dataset, config) -> plans (N, H, D) np.
+            dataset: full TrajectoryDataset.
+            config: ExperimentConfig.
+            model: trained diffusion model (for baseline rollout).
+        """
+        self.train_fn = train_fn
+        self.plan_fn = plan_fn
+        self.dataset = dataset
+        self.config = config
+        self.model = model
+        self.eval_config = config.evaluation
+
+    def rollout_in_env(
+        self,
+        model,
+        n_episodes: int,
+    ) -> Dict:
+        """Execute MPC-style rollouts in the actual Gym environment.
+
+        Replans every ``horizon`` steps using the diffusion model.
+
+        Returns:
+            Dict with mean_return, std_return, violation_rate,
+            mean_violations_per_episode, all_returns.
+        """
+        import gym
+        try:
+            import d4rl  # noqa: F401  — registers D4RL envs
+        except ImportError:
+            pass
+
+        from configs import get_gym_id
+
+        gym_id = get_gym_id(self.config.env_name, self.config.dataset)
+        env = gym.make(gym_id)
+        state_dim = self.config.state_dim
+        action_dim = self.config.action_dim
+        horizon = self.config.diffuser.horizon
+        bound = self.eval_config.constraint_bound
+        max_steps = self.eval_config.max_episode_steps
+
+        returns: List[float] = []
+        violation_counts: List[int] = []
+
+        for ep in range(n_episodes):
+            obs = env.reset()
+            episode_return = 0.0
+            violations = 0
+            step = 0
+
+            while step < max_steps:
+                # Generate a batch of plans and pick the best one
+                plans = self.plan_fn(model, self.dataset, self.config)
+                best_plan = plans[0]  # (H, D) unnormalized
+
+                for h in range(min(horizon, max_steps - step)):
+                    action = best_plan[h, state_dim:state_dim + action_dim]
+                    action = np.clip(
+                        action, env.action_space.low, env.action_space.high
+                    )
+                    obs, reward, done, info = env.step(action)
+                    episode_return += reward
+                    if np.any(np.abs(obs) > bound):
+                        violations += 1
+                    step += 1
+                    if done:
+                        break
+                if done:
+                    break
+
+            returns.append(episode_return)
+            violation_counts.append(violations)
+
+        env.close()
+
+        returns_arr = np.array(returns)
+        violations_arr = np.array(violation_counts)
+
+        return {
+            "mean_return": float(returns_arr.mean()),
+            "std_return": float(returns_arr.std()),
+            "violation_rate": float((violations_arr > 0).mean()),
+            "mean_violations_per_episode": float(violations_arr.mean()),
+            "all_returns": returns_arr.tolist(),
+        }
+
+    def evaluate_intervention(
+        self,
+        influence_scores: np.ndarray,
+        method_name: str = "TIF",
+    ) -> Dict:
+        """Run the full intervention evaluation for one attribution method.
+
+        Args:
+            influence_scores: (N_train,) influence scores.
+            method_name: label for logging.
+
+        Returns:
+            Dict with per-fraction results for each removal strategy.
+        """
+        fractions = self.eval_config.intervention_prune_fractions
+        N = len(self.dataset)
+        n_episodes = self.eval_config.n_rollout_episodes
+        sorted_indices = np.argsort(influence_scores)  # ascending
+        rng = np.random.RandomState(self.eval_config.base_seed + 999)
+
+        results: Dict = {"fractions": {}}
+
+        for frac in fractions:
+            n_remove = int(frac * N)
+            if n_remove == 0:
+                continue
+            logger.info(
+                "Intervention [%s]: removing %d/%d (%.0f%%)",
+                method_name, n_remove, N, frac * 100,
+            )
+            frac_results: Dict = {}
+
+            strategies = [
+                ("remove_most_harmful", sorted_indices[:-n_remove]),
+                ("remove_most_helpful", sorted_indices[n_remove:]),
+                (
+                    "remove_random",
+                    np.setdiff1d(
+                        np.arange(N),
+                        rng.choice(N, n_remove, replace=False),
+                    ),
+                ),
+            ]
+
+            for removal_type, keep_indices in strategies:
+                logger.info("  Strategy: %s", removal_type)
+                subset_dataset = _SubsetDataset(self.dataset, keep_indices)
+                retrain_config = _shallow_copy_config(self.config)
+                retrain_config.diffuser.n_train_steps = (
+                    self.eval_config.retrain_steps
+                )
+
+                try:
+                    retrained_model, _ = self.train_fn(
+                        retrain_config, dataset=subset_dataset, verbose=False
+                    )
+                    rollout_result = self.rollout_in_env(
+                        retrained_model, n_episodes
+                    )
+                    frac_results[removal_type] = rollout_result
+                    logger.info(
+                        "    return=%.1f +/- %.1f, violation_rate=%.2f",
+                        rollout_result["mean_return"],
+                        rollout_result["std_return"],
+                        rollout_result["violation_rate"],
+                    )
+                    del retrained_model
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    logger.warning(
+                        "    Intervention %s failed: %s", removal_type, e
+                    )
+                    frac_results[removal_type] = {"error": str(e)}
+
+            results["fractions"][str(frac)] = frac_results
+
+        return results
 
 
 def save_results(

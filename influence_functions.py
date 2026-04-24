@@ -64,6 +64,9 @@ class _LayerKroneckerFactors:
     # Eigendecomposition of G
     Q_G: Optional[torch.Tensor] = None
     Lambda_G: Optional[torch.Tensor] = None
+    # EK-FAC corrected eigenvalues: hat_lambda[i,j] = E[(Q_G^T grad Q_A)_ij^2]
+    # Shape (k_G, k_A). If None, fall back to outer product of Lambda_G, Lambda_A.
+    Lambda_hat: Optional[torch.Tensor] = None
     n_samples: int = 0
 
 
@@ -193,6 +196,10 @@ class TrajectoryInfluenceComputer:
         Args:
             n_samples: number of data points to use.  None -> full dataset.
         """
+        if self.config.hessian_approx == "plain_dot":
+            logger.info("Plain-dot mode: skipping Hessian computation.")
+            return
+
         if self.config.hessian_approx == "diagonal":
             self._compute_diagonal_hessian(n_samples)
             return
@@ -353,7 +360,102 @@ class TrajectoryInfluenceComputer:
                 lf.Q_G = lf.Q_G[:, -k:]
 
         self.ekfac_state = state
+
+        # EK-FAC second pass: estimate corrected eigenvalues
+        # hat_lambda[i,j] = E[(Q_G^T grad Q_A)_ij^2]
+        if self.config.hessian_approx == "ekfac":
+            self._estimate_corrected_eigenvalues(n_samples)
+
         logger.info("Hessian approximation complete (%d layers).", len(state.layers))
+
+    def _estimate_corrected_eigenvalues(self, n_samples: Optional[int] = None) -> None:
+        """EK-FAC second pass: estimate corrected per-eigenvalue scaling.
+
+        For each per-sample weight gradient G_l (reshaped to d_out x d_in),
+        project into the K-FAC eigenbasis V_tilde = Q_G^T G_l Q_A and
+        accumulate squared values. The resulting hat_lambda is used instead
+        of (Lambda_G outer Lambda_A) for the iHVP, which fixes the systematic
+        underestimate that comes from K-FAC's Kronecker-factorisation assumption.
+        """
+        assert self.ekfac_state is not None
+        logger.info("EK-FAC: estimating corrected eigenvalues (second pass)...")
+        self.model.eval()
+
+        # Initialize accumulators
+        for name, lf in self.ekfac_state.layers.items():
+            if lf.Q_A is None or lf.Q_G is None:
+                continue
+            lf.Lambda_hat = torch.zeros(
+                lf.Q_G.shape[1], lf.Q_A.shape[1], device=lf.Q_A.device
+            )
+
+        # Use batch_size=1 for true per-sample gradients
+        loader = DataLoader(self.dataset, batch_size=1, shuffle=False, num_workers=0)
+        total = n_samples or len(self.dataset)
+        # Cap second pass to be quick — eigenvalues converge fast
+        total = min(total, 2000)
+        n_count = 0
+
+        for batch in tqdm(loader, desc="EK-FAC corrected eigenvalues", total=total):
+            if n_count >= total:
+                break
+            x = batch["trajectories"].to(self.device)
+
+            # Sample one diffusion step + noise
+            t = torch.randint(0, self.diffusion_steps, (1,), device=self.device)
+            noise = torch.randn_like(x)
+            x_noisy = self.model.q_sample(x, t, noise)
+            pred = self.model.model(x_noisy, t)
+            loss = F.mse_loss(pred, noise)
+            self.model.zero_grad()
+            loss.backward()
+
+            # For each layer, project per-sample gradient into eigenbasis
+            for name, lf in self.ekfac_state.layers.items():
+                if lf.Q_A is None or lf.Q_G is None or lf.Lambda_hat is None:
+                    continue
+                layer_mod = self._target_layers.get(name)
+                if layer_mod is None:
+                    continue
+                if layer_mod.weight.grad is None:
+                    continue
+                g = layer_mod.weight.grad.detach()
+
+                # Reshape to (d_out, d_in) consistent with how Q_A, Q_G are aligned
+                if g.dim() == 3:
+                    if isinstance(layer_mod, nn.ConvTranspose1d):
+                        # ConvTranspose1d weight: (C_in, C_out, K) — handled per-kernel
+                        # in iHVP. For correction, average over kernel dim.
+                        for k_idx in range(g.shape[2]):
+                            V_k = g[:, :, k_idx]  # (C_in, C_out)
+                            try:
+                                tilde = lf.Q_G.T @ V_k @ lf.Q_A
+                                lf.Lambda_hat += tilde ** 2
+                            except RuntimeError:
+                                pass
+                        continue
+                    else:
+                        # Conv1d weight: (C_out, C_in, K) -> (C_out, C_in*K)
+                        d_out = g.shape[0]
+                        V = g.reshape(d_out, -1)
+                elif g.dim() == 2:
+                    V = g
+                else:
+                    continue
+
+                try:
+                    tilde = lf.Q_G.T @ V @ lf.Q_A  # (k_G, k_A)
+                    lf.Lambda_hat += tilde ** 2
+                except RuntimeError:
+                    pass
+
+            n_count += 1
+
+        # Average
+        for name, lf in self.ekfac_state.layers.items():
+            if lf.Lambda_hat is not None and n_count > 0:
+                lf.Lambda_hat /= n_count
+        logger.info("EK-FAC corrected eigenvalues estimated over %d samples.", n_count)
 
     def _compute_diagonal_hessian(self, n_samples: Optional[int] = None) -> None:
         """Diagonal Fisher approximation: F_ii = E[g_i^2]."""
@@ -661,12 +763,17 @@ class TrajectoryInfluenceComputer:
                     if lf is not None and lf.Q_A is not None and lf.Q_G is not None:
                         Q_A = lf.Q_A; Q_G = lf.Q_G
                         L_A = lf.Lambda_A; L_G = lf.Lambda_G
+                        if lf.Lambda_hat is not None:
+                            eig_full_ct = lf.Lambda_hat
+                        else:
+                            eig_full_ct = L_G[:, None] * L_A[None, :]
+                        delta_l_ct = self.config.damping * eig_full_ct.max().clamp(min=1e-30)
+                        eig_mat = eig_full_ct + delta_l_ct
                         inv_result = torch.zeros_like(grad)
                         for k_idx in range(K):
                             V_k = grad[:, :, k_idx]  # (C_in, C_out)
                             try:
                                 proj = Q_G.T @ V_k @ Q_A
-                                eig_mat = L_G[:, None] * L_A[None, :] + self.config.damping
                                 proj = proj / eig_mat
                                 inv_result[:, :, k_idx] = Q_G @ proj @ Q_A.T
                             except RuntimeError:
@@ -699,9 +806,17 @@ class TrajectoryInfluenceComputer:
                 result[name] = grad / self.config.damping
                 continue
 
-            # Eigenvalue matrix: lambda_G_i * lambda_A_j + damping
-            eig_matrix = L_G[:, None] * L_A[None, :] + self.config.damping
-            projected = projected / eig_matrix
+            # Use EK-FAC corrected eigenvalues when available; else fall back
+            # to plain K-FAC (lambda_G_i * lambda_A_j).
+            if lf.Lambda_hat is not None:
+                eig_full = lf.Lambda_hat
+            else:
+                eig_full = L_G[:, None] * L_A[None, :]
+            # Per-layer relative damping (Mlodozeniec et al., 2025): δ_l = α·λ_max(l).
+            # Without this, fixed absolute damping dominates the spectrum (most
+            # eigenvalues are <<damping) and iHVP collapses to scaled identity.
+            delta_l = self.config.damping * eig_full.max().clamp(min=1e-30)
+            projected = projected / (eig_full + delta_l)
 
             # Un-project: Q_G (projected) Q_A^T  ->  (d_out, d_in)
             V_inv = Q_G @ projected @ Q_A.T
@@ -757,7 +872,9 @@ class TrajectoryInfluenceComputer:
         g_train = self.compute_training_gradient(train_idx)
 
         # H^{-1} g_train
-        if self.config.hessian_approx in ("ekfac", "kfac"):
+        if self.config.hessian_approx == "plain_dot":
+            h_inv_g = g_train  # identity: no Hessian inverse
+        elif self.config.hessian_approx in ("ekfac", "kfac"):
             h_inv_g = self._ihvp_ekfac(g_train)
         elif self.config.hessian_approx == "diagonal":
             h_inv_g = self._ihvp_diagonal(g_train)
@@ -766,11 +883,13 @@ class TrajectoryInfluenceComputer:
                 f"Unknown hessian_approx: {self.config.hessian_approx}"
             )
 
-        # Dot product: -g_test^T H^{-1} g_train
+        # I = -∇f · H^{-1}∇ℓ; with proxy_type using POSITIVE loss in
+        # compute_proxy_gradient (paper f = -loss, so ∇f = -∇loss),
+        # the two negations cancel: I = +∇loss · H^{-1}∇ℓ.
         score = 0.0
         for name in g_test:
             if name in h_inv_g:
-                score -= (g_test[name] * h_inv_g[name]).sum().item()
+                score += (g_test[name] * h_inv_g[name]).sum().item()
 
         return score
 
@@ -803,7 +922,9 @@ class TrajectoryInfluenceComputer:
         # Pre-compute H^{-1} g_test for efficiency
         # (then I(z_i) = - (H^{-1} g_test)^T g_train_i,
         #  which is equivalent by symmetry of H)
-        if self.config.hessian_approx in ("ekfac", "kfac"):
+        if self.config.hessian_approx == "plain_dot":
+            h_inv_g_test = g_test  # identity: no Hessian inverse
+        elif self.config.hessian_approx in ("ekfac", "kfac"):
             h_inv_g_test = self._ihvp_ekfac(g_test)
         elif self.config.hessian_approx == "diagonal":
             h_inv_g_test = self._ihvp_diagonal(g_test)
@@ -819,7 +940,7 @@ class TrajectoryInfluenceComputer:
             score = 0.0
             for name in h_inv_g_test:
                 if name in g_train:
-                    score -= (h_inv_g_test[name] * g_train[name]).sum().item()
+                    score += (h_inv_g_test[name] * g_train[name]).sum().item()
             scores[i] = score
 
         return scores
@@ -854,7 +975,9 @@ class TrajectoryInfluenceComputer:
 
         # Pre-compute test gradient and H^{-1} g_test
         g_test = self.compute_proxy_gradient(plan_tau, proxy_type)
-        if self.config.hessian_approx in ("ekfac", "kfac"):
+        if self.config.hessian_approx == "plain_dot":
+            h_inv_g_test = g_test  # identity: no Hessian inverse
+        elif self.config.hessian_approx in ("ekfac", "kfac"):
             h_inv_g_test = self._ihvp_ekfac(g_test)
         elif self.config.hessian_approx == "diagonal":
             h_inv_g_test = self._ihvp_diagonal(g_test)
@@ -918,7 +1041,7 @@ class TrajectoryInfluenceComputer:
                         )
                 flat_grad = torch.cat(flat_grad)
 
-                scores[idx] = -(flat_h_inv * flat_grad).sum().item()
+                scores[idx] = (flat_h_inv * flat_grad).sum().item()
                 idx += 1
 
         return scores[:n]

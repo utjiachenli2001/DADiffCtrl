@@ -78,7 +78,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("run_experiments")
 
-RESULTS_DIR = "/home/ljc37/dr-claw/DiffusionControl/Experiment/analysis"
+RESULTS_DIR = "/mnt/sdb/ljc/DADiffCtrl/analysis"
 
 
 # ---------------------------------------------------------------------------
@@ -108,14 +108,14 @@ def parse_args() -> argparse.Namespace:
         "--experiment",
         type=str,
         default="lds",
-        choices=["lds", "safety", "curation", "all"],
+        choices=["lds", "safety", "curation", "intervention", "all"],
         help="Which experiment to run.",
     )
     parser.add_argument(
         "--hessian-approx",
         type=str,
         default="ekfac",
-        choices=["ekfac", "kfac", "diagonal"],
+        choices=["ekfac", "kfac", "diagonal", "plain_dot"],
         help="Hessian approximation for influence functions.",
     )
     parser.add_argument(
@@ -166,6 +166,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a pre-trained model checkpoint to load.",
     )
+    parser.add_argument(
+        "--lds-worker",
+        action="store_true",
+        help=(
+            "Worker mode: skip influence/baseline computation. "
+            "Only retrain LDS subsets (in reverse) and populate the "
+            "shared cache. Pair with a main process for parallel LDS."
+        ),
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help=(
+            "Smoke test: run all experiments end-to-end with minimal sizes. "
+            "Implies --debug model architecture but uses slightly longer "
+            "training for meaningful (if noisy) results."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -191,7 +209,30 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
     if args.n_subsets is not None:
         eval_cfg.n_subsets = args.n_subsets
 
-    if args.debug:
+    if getattr(args, "smoke_test", False):
+        logger.info("SMOKE TEST mode: minimal end-to-end validation.")
+        # Tiny model architecture (same as debug)
+        diffuser_cfg.dim = 32
+        diffuser_cfg.dim_mults = (1, 2)
+        diffuser_cfg.n_residual_blocks = 1
+        diffuser_cfg.n_diffusion_steps = 20
+        diffuser_cfg.batch_size = 32
+        diffuser_cfg.n_plan_samples = 4
+        diffuser_cfg.n_planning_steps = 20
+        diffuser_cfg.log_interval = 500
+        diffuser_cfg.save_interval = 1000
+        # Slightly longer training than debug for meaningful results
+        diffuser_cfg.n_train_steps = 2000
+        influence_cfg.n_eigenvectors = 10
+        influence_cfg.gradient_batch_size = 8
+        dtrak_cfg.projection_dim = 256
+        eval_cfg.n_subsets = 3
+        eval_cfg.retrain_steps = 1000
+        eval_cfg.prune_fractions = [0.3]
+        eval_cfg.intervention_prune_fractions = [0.1]
+        eval_cfg.n_rollout_episodes = 3
+        args.debug = True  # also set debug for max_traj limit
+    elif args.debug:
         logger.info("DEBUG mode: using tiny configuration.")
         diffuser_cfg.dim = 32
         diffuser_cfg.dim_mults = (1, 2)
@@ -222,6 +263,13 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         evaluation=eval_cfg,
         results_dir=RESULTS_DIR,
     )
+
+    # Per-cell checkpoint directory to avoid collisions in grid runs
+    config.checkpoint_dir = os.path.join(
+        config.checkpoint_dir,
+        f"{config.env_name}_{config.dataset}_seed{args.seed}",
+    )
+
     return config
 
 
@@ -354,6 +402,7 @@ def run_lds_experiment(
     dataset: TrajectoryDataset,
     influence_scores: Dict[str, np.ndarray],
     ref_plan: Optional[np.ndarray] = None,
+    cache_dir: Optional[str] = None,
 ) -> Dict:
     """Run the Linear Datamodeling Score experiment.
 
@@ -394,6 +443,7 @@ def run_lds_experiment(
         config=config,
         eval_config=config.evaluation,
         proxy_fn_factory=proxy_fn_factory,
+        cache_dir=cache_dir,
     )
 
     results = {"full_model_proxy": full_proxy, "methods": {}}
@@ -507,6 +557,11 @@ def run_safety_experiment(
     nn_baseline = NearestNeighborAttribution(dataset)
     nn_scores_safety = nn_baseline.compute_scores(ref_plan_tensor)[:n_scores]
 
+    # Free safety TIF compute (Hessian factors) before D-TRAK allocates 18GB+
+    del tic
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     dtrak_baseline = TrajectoryDTRAK(
         model=diffusion,
         dataset=dataset,
@@ -515,6 +570,8 @@ def run_safety_experiment(
     )
     dtrak_baseline.precompute_training_features(max_samples=n_scores)
     dtrak_scores_safety = dtrak_baseline.compute_scores(ref_plan_tensor)[:n_scores]
+    del dtrak_baseline
+    torch.cuda.empty_cache()
 
     # Build scores dict: only include methods evaluated on the same unsafe plan.
     # Drop "TIF (ours)" from main() since it was computed on the original ref_plan,
@@ -601,6 +658,59 @@ def run_curation_experiment(
     return results
 
 
+def run_intervention_experiment(
+    config: ExperimentConfig,
+    diffusion: "GaussianDiffusion",
+    dataset: "TrajectoryDataset",
+    influence_scores: Dict[str, np.ndarray],
+) -> Dict:
+    """Run downstream intervention experiment.
+
+    Removes top-attributed data, retrains, rolls out in actual Gym env,
+    and measures return + constraint violations.
+    """
+    from evaluation import DownstreamInterventionEvaluator
+
+    logger.info("=" * 60)
+    logger.info("EXPERIMENT: Downstream Intervention")
+    logger.info("=" * 60)
+
+    intervention_eval = DownstreamInterventionEvaluator(
+        train_fn=train,
+        plan_fn=lambda m, d, c: plan(m, d, c, reward_guidance=False),
+        dataset=dataset,
+        config=config,
+        model=diffusion,
+    )
+
+    # Baseline: full-data model rollout
+    logger.info("Computing baseline (full-data model) rollout...")
+    baseline_result = intervention_eval.rollout_in_env(
+        diffusion, config.evaluation.n_rollout_episodes
+    )
+    logger.info(
+        "Baseline: return=%.1f +/- %.1f, violation_rate=%.2f",
+        baseline_result["mean_return"],
+        baseline_result["std_return"],
+        baseline_result["violation_rate"],
+    )
+
+    results: Dict = {"baseline": baseline_result, "methods": {}}
+
+    # Run intervention for TIF and NN (the two most informative methods)
+    methods_to_test = ["TIF", "NearestNeighbor"]
+    for method_name in methods_to_test:
+        if method_name not in influence_scores:
+            continue
+        logger.info("Running intervention for method: %s", method_name)
+        intervention_result = intervention_eval.evaluate_intervention(
+            influence_scores[method_name], method_name=method_name
+        )
+        results["methods"][method_name] = intervention_result
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -672,6 +782,41 @@ def main() -> None:
     logger.info("Reference plan shape: %s", ref_plan.shape)
 
     # ---------------------------------------------------------------
+    # LDS worker mode: only populate the subset cache (in reverse) and exit.
+    # Influence/baselines are skipped — the main process computes those.
+    # ---------------------------------------------------------------
+    if args.lds_worker:
+        from evaluation import TrajectoryLDS
+        lds_cache = os.path.join(
+            RESULTS_DIR, "lds_cache",
+            f"{args.env}_{args.dataset}_seed{args.seed}",
+        )
+        logger.info("LDS WORKER mode — cache dir: %s", lds_cache)
+        proxy_fn = make_proxy_fn(config, dataset, diffusion_model=diffusion)
+        proxy_fn_factory = lambda m: make_proxy_fn(config, dataset, diffusion_model=m)
+        full_proxy = proxy_fn(ref_plan)
+        worker_evaluator = TrajectoryLDS(
+            model_class=None,
+            train_fn=train,
+            plan_fn=lambda m, d, c: plan(m, d, c, reward_guidance=False),
+            proxy_fn=proxy_fn,
+            dataset=dataset,
+            config=config,
+            eval_config=config.evaluation,
+            proxy_fn_factory=proxy_fn_factory,
+            cache_dir=lds_cache,
+        )
+        # Dummy zero scores — worker only populates the proxy cache.
+        dummy_scores = np.zeros(len(dataset), dtype=np.float32)
+        worker_evaluator.compute_lds(
+            influence_scores=dummy_scores,
+            full_model_proxy=full_proxy,
+            reverse=True,
+        )
+        logger.info("LDS WORKER finished populating cache. Exiting.")
+        return
+
+    # ---------------------------------------------------------------
     # 4. Compute influence scores (our method + baselines)
     # ---------------------------------------------------------------
     max_inf_samples = args.max_influence_samples
@@ -735,6 +880,9 @@ def main() -> None:
     dtrak_scores = dtrak.compute_scores(ref_plan_tensor)[:n_effective]
     influence_scores["TRAK (1-ckpt)"] = dtrak_scores
     logger.info("TRAK (1-ckpt) computed in %.1f seconds.", time.time() - t0)
+    # Free the 37GB GPU projection matrix before downstream stages
+    del dtrak
+    torch.cuda.empty_cache()
 
     # ---------------------------------------------------------------
     # 5. Run experiments
@@ -753,7 +901,8 @@ def main() -> None:
     }
 
     experiments_to_run = (
-        ["lds", "safety", "curation"] if config.experiment == "all"
+        ["lds", "safety", "curation", "intervention"]
+        if config.experiment == "all"
         else [config.experiment]
     )
 
@@ -774,9 +923,13 @@ def main() -> None:
         logger.info("=" * 60)
 
         if exp_name == "lds":
+            lds_cache = os.path.join(
+                RESULTS_DIR, "lds_cache",
+                f"{args.env}_{args.dataset}_seed{args.seed}",
+            )
             result = run_lds_experiment(
                 config, diffusion, eval_dataset, influence_scores,
-                ref_plan=ref_plan,
+                ref_plan=ref_plan, cache_dir=lds_cache,
             )
         elif exp_name == "safety":
             result = run_safety_experiment(
@@ -786,6 +939,10 @@ def main() -> None:
             result = run_curation_experiment(
                 config, diffusion, eval_dataset, influence_scores,
                 ref_plan=ref_plan,
+            )
+        elif exp_name == "intervention":
+            result = run_intervention_experiment(
+                config, diffusion, eval_dataset, influence_scores,
             )
         else:
             logger.error("Unknown experiment: %s", exp_name)
@@ -797,7 +954,10 @@ def main() -> None:
     # 6. Save results
     # ---------------------------------------------------------------
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_name = f"{config.env_name}_{config.dataset}_{config.experiment}_{timestamp}"
+    result_name = (
+        f"{config.env_name}_{config.dataset}_seed{args.seed}"
+        f"_{config.experiment}_{config.influence.hessian_approx}_{timestamp}"
+    )
     filepath = save_results(all_results, result_name, config.results_dir)
     logger.info("All results saved to: %s", filepath)
 

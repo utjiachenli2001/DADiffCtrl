@@ -233,13 +233,18 @@ class TemporalUNet(nn.Module):
 
         # Decoder
         for blocks in self.up_blocks:
+            first_rtb = True
             for block in blocks:
                 if isinstance(block, ResidualTemporalBlock):
-                    skip = skips.pop()
-                    # Pad if needed (horizon may not be exactly divisible)
-                    if x.shape[-1] != skip.shape[-1]:
-                        x = F.pad(x, (0, skip.shape[-1] - x.shape[-1]))
-                    x = block(torch.cat([x, skip], dim=1), t_emb)
+                    if first_rtb:
+                        skip = skips.pop()
+                        # Pad if needed (horizon may not be exactly divisible)
+                        if x.shape[-1] != skip.shape[-1]:
+                            x = F.pad(x, (0, skip.shape[-1] - x.shape[-1]))
+                        x = block(torch.cat([x, skip], dim=1), t_emb)
+                        first_rtb = False
+                    else:
+                        x = block(x, t_emb)
                 else:
                     x = block(x)
 

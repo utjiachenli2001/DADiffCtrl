@@ -208,16 +208,22 @@ class TrajectoryDTRAK:
     def _get_projection_matrix(self) -> torch.Tensor:
         """Generate the random projection matrix P ~ N(0, 1/d).
 
-        Shape: (projection_dim, param_dim).
-        We generate on the fly from a fixed seed to avoid storing the full
-        matrix in memory.  For large models, consider chunked projection.
+        Shape: (projection_dim, param_dim). Cached on the instance and
+        materialized in fp16 directly on the GPU so it fits for large
+        param_dim (e.g. 1024 x 18M params ~= 37 GB).
         """
-        rng = torch.Generator(device="cpu").manual_seed(self._proj_seed)
-        P = torch.randn(
-            self._projection_dim, self.param_dim, generator=rng, device="cpu"
-        )
-        P /= np.sqrt(self._projection_dim)
-        return P.to(self.device)
+        if getattr(self, "_P_cache", None) is None:
+            rng = torch.Generator(device=self.device).manual_seed(self._proj_seed)
+            P = torch.randn(
+                self._projection_dim,
+                self.param_dim,
+                generator=rng,
+                device=self.device,
+                dtype=torch.float16,
+            )
+            P /= np.sqrt(self._projection_dim)
+            self._P_cache = P
+        return self._P_cache
 
     def _compute_flat_gradient(self, x: torch.Tensor) -> torch.Tensor:
         """Compute flattened gradient of diffusion loss for a single sample.
@@ -270,7 +276,7 @@ class TrajectoryDTRAK:
         for i in tqdm(range(n), desc="D-TRAK: projecting training gradients"):
             x = self.dataset[i]["trajectories"].unsqueeze(0).to(self.device)
             g = self._compute_flat_gradient(x)
-            phi = (P @ g).cpu().numpy()
+            phi = (P @ g.to(P.dtype)).float().cpu().numpy()
             features[i] = phi
 
         self._train_features = features
@@ -300,7 +306,7 @@ class TrajectoryDTRAK:
         plan_tau = plan_tau.to(self.device)
 
         g_test = self._compute_flat_gradient(plan_tau)
-        phi_test = (P @ g_test).cpu().numpy()  # (projection_dim,)
+        phi_test = (P @ g_test.to(P.dtype)).float().cpu().numpy()  # (projection_dim,)
 
         # Kernel solve: (Φ^T Φ + λI)^{-1} φ_test
         # Φ is (N, d), so Φ^T Φ is (d, d)

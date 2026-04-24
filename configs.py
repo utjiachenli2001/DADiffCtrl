@@ -47,6 +47,16 @@ DATASET_VARIANTS: List[str] = [
     "expert",
 ]
 
+# Default grid for multi-cell experiments
+GRID_CELLS: List[Tuple[str, str]] = [
+    ("halfcheetah", "medium"),
+    ("hopper", "medium"),
+    ("walker2d", "medium"),
+    ("halfcheetah", "medium-expert"),
+]
+
+GRID_SEEDS: List[int] = [0, 1, 2]
+
 
 def get_gym_id(env_name: str, dataset: str) -> str:
     """Return the full Gym environment ID for a given env/dataset pair."""
@@ -116,7 +126,7 @@ class DiffuserConfig:
 class InfluenceConfig:
     """Hyperparameters for trajectory influence computation."""
 
-    # Hessian approximation: "ekfac" | "kfac" | "diagonal"
+    # Hessian approximation: "ekfac" | "kfac" | "diagonal" | "plain_dot"
     hessian_approx: str = "ekfac"
 
     # Number of data points to use when accumulating Kronecker factors.
@@ -149,7 +159,7 @@ class DTRAKConfig:
     """Hyperparameters for the Trajectory D-TRAK baseline."""
 
     # Dimension of random projection
-    projection_dim: int = 4096
+    projection_dim: int = 1024
 
     # Number of model checkpoints to ensemble over
     n_checkpoints: int = 1
@@ -187,6 +197,18 @@ class EvaluationConfig:
     # Threshold on per-step constraint value to mark a trajectory as unsafe
     safety_threshold: float = 0.0
 
+    # --- Downstream Intervention ---
+    # Fractions of training data to remove for intervention evaluation
+    intervention_prune_fractions: List[float] = field(
+        default_factory=lambda: [0.05, 0.1, 0.2, 0.3]
+    )
+    # Number of rollout episodes for environment evaluation
+    n_rollout_episodes: int = 20
+    # Maximum steps per rollout episode
+    max_episode_steps: int = 1000
+    # State-bound threshold for constraint violation detection
+    constraint_bound: float = 3.0
+
     # --- General ---
     # Number of independent seeds for repeated experiments
     n_seeds: int = 3
@@ -204,7 +226,7 @@ class ExperimentConfig:
 
     env_name: str = "halfcheetah"
     dataset: str = "medium"
-    experiment: str = "lds"  # "lds" | "safety" | "curation" | "all"
+    experiment: str = "lds"  # "lds" | "safety" | "curation" | "intervention" | "all"
 
     diffuser: DiffuserConfig = field(default_factory=DiffuserConfig)
     influence: InfluenceConfig = field(default_factory=InfluenceConfig)
@@ -212,12 +234,10 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     # Where to save results
-    results_dir: str = "/home/ljc37/dr-claw/DiffusionControl/Experiment/analysis"
+    results_dir: str = "/mnt/sdb/ljc/DADiffCtrl/analysis"
 
     # Checkpoint directory
-    checkpoint_dir: str = (
-        "/home/ljc37/dr-claw/DiffusionControl/Experiment/core_code/checkpoints"
-    )
+    checkpoint_dir: str = "/mnt/sdb/ljc/DADiffCtrl/checkpoints"
 
     def __post_init__(self) -> None:
         """Propagate environment dimensions into diffuser config."""
