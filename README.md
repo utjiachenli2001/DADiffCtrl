@@ -34,6 +34,11 @@ python run_grid.py --smoke-test
 ### 3. Full Reproduction
 
 ```bash
+# 12 GPUs (~6 hours) - recommended
+python run_grid.py --experiments all --mode parallel --n-workers 12 --gpu-ids 0 1 2 3 4 5 6 7 8 9 10 11
+python run_ablation.py
+python aggregate_results.py --latex
+
 # 4 GPUs (~18 hours)
 python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3
 python run_ablation.py
@@ -43,20 +48,34 @@ python aggregate_results.py --latex
 bash run_all.sh
 ```
 
-### 4. Resume After Interruption
+### 4. Multi-Machine Setup
+
+If GPUs are on different machines:
+
+**Machine 1 (4× A100):**
+```bash
+python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3 --seeds 0
+```
+
+**Machine 2 (8× Pro6000):**
+```bash
+python run_grid.py --experiments all --mode parallel --n-workers 8 --gpu-ids 0 1 2 3 4 5 6 7 --seeds 1 2
+```
+
+### 5. Resume After Interruption
 
 ```bash
 python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3 --resume
 ```
 
-### 5. Custom Paths (Optional)
+### 6. Custom Paths (Optional)
 
 ```bash
 export DADIFFCTRL_RESULTS_DIR=/path/to/results
 export DADIFFCTRL_CHECKPOINT_DIR=/path/to/checkpoints
 ```
 
-### 6. Output
+### 7. Output
 
 ```
 analysis/
@@ -75,7 +94,8 @@ analysis/
 | Smoke test | `python run_grid.py --smoke-test` |
 | Single cell | `python run_experiments.py --env halfcheetah --dataset medium --experiment all --seed 0` |
 | Full grid (sequential) | `python run_grid.py --experiments all` |
-| Full grid (parallel) | `python run_grid.py --experiments all --mode parallel --n-workers N --gpu-ids 0 1 ...` |
+| Full grid (4 GPUs) | `python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3` |
+| Full grid (12 GPUs) | `python run_grid.py --experiments all --mode parallel --n-workers 12 --gpu-ids 0 1 2 3 4 5 6 7 8 9 10 11` |
 | Ablation | `python run_ablation.py` |
 | Aggregate | `python aggregate_results.py --latex` |
 | Dry run | `python run_grid.py --experiments all --dry-run` |
@@ -97,6 +117,7 @@ analysis/
 | `--mode` | sequential, parallel | Execution mode |
 | `--n-workers` | 1, 2, ... | Number of parallel GPUs |
 | `--gpu-ids` | 0 1 2 ... | GPU IDs to use |
+| `--seeds` | 0 1 2 ... | Specific seeds to run |
 
 ---
 
@@ -115,6 +136,18 @@ analysis/
 ├── run_all.sh              # Full pipeline script
 └── debug/                  # Validation scripts
 ```
+
+---
+
+## Key Hyperparameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| LDS subsets (K) | 50 | Following TRAK convention |
+| Subset fraction | 0.5 | 50% of data per subset |
+| Prune fractions | [0.05, 0.1, 0.2, 0.3] | For curation experiment |
+| Seeds | 0, 1, 2 | 3 seeds for error bars |
+| Grid cells | 9 | 3 envs × 3 datasets |
 
 ---
 
