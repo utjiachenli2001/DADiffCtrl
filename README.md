@@ -8,45 +8,95 @@ Trajectory Influence Functions (TIF) attribute the influence of individual train
 
 ## Quick Start
 
+### 1. Installation
+
 ```bash
-# Install
-conda create -n dadiffctrl python=3.10 && conda activate dadiffctrl
+# Create environment
+conda create -n dadiffctrl python=3.10
+conda activate dadiffctrl
+
+# Install dependencies (order matters)
 pip install "cython<3" "setuptools<81"
 pip install git+https://github.com/aravindr93/mjrl.git
 pip install torch>=2.0 numpy scipy scikit-learn tqdm d4rl "gym==0.21.0"
 
-# Run smoke test (~15 min)
-python run_grid.py --smoke-test
+# Required environment variables
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
 
-# Full reproduction (4 GPUs, ~18 hours)
+### 2. Smoke Test (~15 min, 1 GPU)
+
+```bash
+python run_grid.py --smoke-test
+```
+
+### 3. Full Reproduction
+
+```bash
+# 4 GPUs (~18 hours)
 python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3
 python run_ablation.py
 python aggregate_results.py --latex
+
+# Or use the wrapper script
+bash run_all.sh
 ```
 
----
+### 4. Resume After Interruption
 
-## Experiments
-
-| Experiment | Command | Output |
-|------------|---------|--------|
-| **Smoke test** | `python run_grid.py --smoke-test` | Quick validation |
-| **Single cell** | `python run_experiments.py --env halfcheetah --dataset medium --experiment all` | 1 result JSON |
-| **Full grid** | `python run_grid.py --experiments all --mode parallel --n-workers N --gpu-ids ...` | 27 JSONs |
-| **Ablation** | `python run_ablation.py` | Hessian comparison |
-| **Aggregate** | `python aggregate_results.py --latex` | LaTeX tables |
-
-### Resume interrupted runs
 ```bash
 python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3 --resume
 ```
 
-### Environment variables
+### 5. Custom Paths (Optional)
+
 ```bash
 export DADIFFCTRL_RESULTS_DIR=/path/to/results
 export DADIFFCTRL_CHECKPOINT_DIR=/path/to/checkpoints
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # reduces OOM
 ```
+
+### 6. Output
+
+```
+analysis/
+├── halfcheetah_medium_seed0_all_ekfac_*.json  # Per-cell results
+├── ablation_hessian_*.json                     # Ablation table
+├── aggregated.json                             # Mean ± std
+└── failed_cells.json                           # For retry
+```
+
+---
+
+## Commands Reference
+
+| Task | Command |
+|------|---------|
+| Smoke test | `python run_grid.py --smoke-test` |
+| Single cell | `python run_experiments.py --env halfcheetah --dataset medium --experiment all --seed 0` |
+| Full grid (sequential) | `python run_grid.py --experiments all` |
+| Full grid (parallel) | `python run_grid.py --experiments all --mode parallel --n-workers N --gpu-ids 0 1 ...` |
+| Ablation | `python run_ablation.py` |
+| Aggregate | `python aggregate_results.py --latex` |
+| Dry run | `python run_grid.py --experiments all --dry-run` |
+
+---
+
+## CLI Options
+
+| Flag | Values | Description |
+|------|--------|-------------|
+| `--env` | halfcheetah, hopper, walker2d | D4RL environment |
+| `--dataset` | medium, medium-replay, medium-expert | Dataset variant |
+| `--experiment` | lds, safety, curation, intervention, all | Evaluation protocol |
+| `--hessian-approx` | ekfac, kfac, diagonal, plain_dot | Curvature approximation |
+| `--seed` | 0, 1, 2, ... | Random seed |
+| `--smoke-test` | — | Minimal validation |
+| `--resume` | — | Skip completed cells |
+| `--dry-run` | — | Print commands only |
+| `--mode` | sequential, parallel | Execution mode |
+| `--n-workers` | 1, 2, ... | Number of parallel GPUs |
+| `--gpu-ids` | 0 1 2 ... | GPU IDs to use |
 
 ---
 
@@ -62,12 +112,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # reduces OOM
 ├── run_grid.py             # Multi-cell orchestrator
 ├── run_ablation.py         # Hessian ablation
 ├── aggregate_results.py    # Result aggregation
+├── run_all.sh              # Full pipeline script
 └── debug/                  # Validation scripts
 ```
 
 ---
 
-## API
+## API Usage
 
 ```python
 from configs import ExperimentConfig
@@ -98,42 +149,16 @@ print(f"Most helpful: {scores.argsort()[-5:][::-1]}")
 
 ---
 
-## CLI Options
-
-| Flag | Values | Description |
-|------|--------|-------------|
-| `--env` | halfcheetah, hopper, walker2d | D4RL environment |
-| `--dataset` | medium, medium-replay, medium-expert | Dataset variant |
-| `--experiment` | lds, safety, curation, intervention, all | Evaluation protocol |
-| `--hessian-approx` | ekfac, kfac, diagonal, plain_dot | Curvature approximation |
-| `--seed` | 0, 1, 2, ... | Random seed |
-| `--smoke-test` | — | Minimal validation |
-| `--resume` | — | Skip completed cells |
-| `--dry-run` | — | Print commands only |
-
----
-
 ## Hardware Requirements
 
-| Resource | Requirement |
-|----------|-------------|
-| GPU VRAM | 48GB+ (A6000, A100) |
-| System RAM | 40GB per worker |
-| Storage | ~50GB for checkpoints |
-| Time (2 GPUs) | ~3 days |
-| Time (12 GPUs) | ~15 hours |
-
----
-
-## Output Files
-
-```
-analysis/
-├── halfcheetah_medium_seed0_all_ekfac_20260427_*.json   # Per-cell results
-├── ablation_hessian_20260427_*.json                     # Ablation table
-├── aggregated.json                                       # Mean ± std
-└── failed_cells.json                                     # For retry
-```
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU VRAM | 24GB | 48GB+ (A6000, A100) |
+| System RAM | 32GB | 64GB+ |
+| Storage | 20GB | 50GB |
+| Time (1 GPU) | ~6 days | — |
+| Time (4 GPUs) | ~18 hours | — |
+| Time (12 GPUs) | — | ~6 hours |
 
 ---
 
