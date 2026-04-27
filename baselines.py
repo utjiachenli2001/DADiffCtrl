@@ -16,6 +16,7 @@ returning an (N_train,) array of attribution scores.
 
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Optional
 
@@ -324,3 +325,19 @@ class TrajectoryDTRAK:
             scores = Phi @ phi_test
 
         return scores.astype(np.float64)
+
+    def cleanup(self) -> None:
+        """Release GPU memory used by the projection matrix and training features.
+
+        Call this after compute_scores() when the D-TRAK instance is no longer needed,
+        especially before allocating memory for another baseline or retraining.
+        """
+        if hasattr(self, "_P_cache") and self._P_cache is not None:
+            del self._P_cache
+            self._P_cache = None
+        if self._train_features is not None:
+            del self._train_features
+            self._train_features = None
+        torch.cuda.empty_cache()
+        gc.collect()
+        logger.info("D-TRAK: cleanup complete, GPU memory released.")

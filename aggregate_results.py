@@ -28,7 +28,7 @@ import numpy as np
 
 logger = logging.getLogger("aggregate_results")
 
-RESULTS_DIR = "/mnt/sdb/ljc/DADiffCtrl/analysis"
+RESULTS_DIR = os.environ.get("DADIFFCTRL_RESULTS_DIR", "./analysis")
 
 # ── Filename parsing ────────────────────────────────────────────────
 

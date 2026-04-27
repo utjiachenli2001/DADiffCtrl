@@ -19,6 +19,7 @@ Implements four evaluation protocols:
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -262,6 +263,10 @@ class TrajectoryLDS:
                 logger.warning("Subset %d failed: %s. Skipping.", k, e)
             finally:
                 self._release_lock(k)
+                # Free GPU memory after each retrain iteration
+                del retrained_model
+                torch.cuda.empty_cache()
+                gc.collect()
 
         actual_deltas = []
         predicted_deltas = []
@@ -596,6 +601,7 @@ class DataCurationEvaluator:
         retrain_config = _shallow_copy_config(self.config)
         retrain_config.diffuser.n_train_steps = self.eval_config.retrain_steps
 
+        model = None
         try:
             model, _ = self.train_fn(
                 retrain_config, dataset=subset_dataset, verbose=False
@@ -610,6 +616,12 @@ class DataCurationEvaluator:
         except Exception as e:
             logger.warning("Retrain failed: %s", e)
             return 0.0
+        finally:
+            # Free GPU memory after each retrain iteration
+            if model is not None:
+                del model
+            torch.cuda.empty_cache()
+            gc.collect()
 
 
 # ---------------------------------------------------------------------------

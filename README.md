@@ -9,48 +9,135 @@ This repository implements Trajectory Influence Functions (Trajectory-IF), the f
 
 ---
 
-## Installation
-
-**Requirements:** Python >= 3.9, CUDA-capable GPU (recommended).
-
-```bash
-# Clone the repository
-git clone <repo-url>
-cd DiffusionControl/Experiment/core_code
-
-# Create a virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-**Note on D4RL:** The D4RL package requires MuJoCo. Follow the [MuJoCo installation guide](https://github.com/openai/mujoco-py#install-mujoco) and ensure `mujoco-py` is properly configured before running experiments.
-
----
-
-## File Descriptions
+## Repository Layout
 
 | File | Description |
 |------|-------------|
-| `configs.py` | Centralized configuration dataclasses for all hyperparameters: Diffuser architecture (`DiffuserConfig`), influence computation (`InfluenceConfig`), D-TRAK baseline (`DTRAKConfig`), evaluation protocols (`EvaluationConfig`), and the top-level `ExperimentConfig`. Also contains the D4RL environment registry with state/action dimensions. |
-| `diffuser_minimal.py` | Self-contained Diffuser implementation (~680 lines). Includes the `TemporalUNet` (1D temporal U-Net with residual blocks, sinusoidal timestep embeddings, and skip connections), `GaussianDiffusion` (DDPM forward/reverse process and loss), `TrajectoryDataset` (D4RL loader that chunks episodes into fixed-horizon segments with normalization), `EMA` helper, `train()` loop, and `plan()` inference with optional reward-conditioned guidance. |
-| `influence_functions.py` | Core contribution: `TrajectoryInfluenceComputer` class (~790 lines). Implements EK-FAC Hessian approximation adapted for 1D temporal convolutions, four proxy measurement gradients (likelihood, reward-conditioned, constraint satisfaction, return), inverse-Hessian-vector products via Kronecker-factored eigenbasis, and both sequential and batched influence score computation. |
-| `baselines.py` | Four attribution baselines (~300 lines): `RandomAttribution` (uniform random scores), `RewardRanking` (cumulative reward), `NearestNeighborAttribution` (negative L2 distance in trajectory space), and `TrajectoryDTRAK` (D-TRAK with random-projected gradients adapted for trajectory diffusion). |
-| `evaluation.py` | Three evaluation protocols (~550 lines): `TrajectoryLDS` (Linear Datamodeling Score via subset retraining and Spearman correlation), `SafetyAttributionAUC` (ROC AUC for identifying unsafe training data), and `DataCurationEvaluator` (attribution-guided data pruning with retrain-and-evaluate). Also includes `save_results()` for JSON serialization. |
-| `run_experiments.py` | Main experiment runner (~585 lines). Parses CLI arguments, builds configs, trains or loads the Diffuser, computes influence scores for all methods, and runs the selected experiment (LDS, safety, curation, or all). Outputs results as JSON to the analysis directory. |
-| `__init__.py` | Package marker. |
-| `requirements.txt` | Python package dependencies. |
+| `configs.py` | Configuration dataclasses for all hyperparameters (Diffuser, influence, D-TRAK, evaluation) |
+| `diffuser_minimal.py` | Minimal Diffuser implementation (Temporal U-Net + DDPM) |
+| `influence_functions.py` | Core TIF implementation with EK-FAC/K-FAC/diagonal approximations |
+| `baselines.py` | Attribution baselines: Random, RewardRanking, NearestNeighbor, D-TRAK |
+| `evaluation.py` | Evaluation protocols: LDS, SafetyAUC, DataCuration, Intervention |
+| `run_experiments.py` | Main experiment runner for a single (env, dataset, seed) cell |
+| `run_grid.py` | Grid orchestrator for multi-cell experiments |
+| `run_ablation.py` | Hessian approximation ablation study |
+| `aggregate_results.py` | Aggregate results across seeds, output LaTeX tables |
+| `run_all.sh` | Top-level script to run full pipeline |
+| `debug/` | Debug and validation scripts |
 
 ---
 
-## Quick Start: Computing Influence Scores
+## Installation
+
+**Requirements:** Python 3.10+, CUDA-capable GPU with 48GB+ VRAM recommended.
+
+```bash
+# Create conda environment
+conda create -n dadiffctrl python=3.10
+conda activate dadiffctrl
+
+# Install cython<3 BEFORE mujoco_py builds (required for older mujoco)
+pip install "cython<3"
+
+# Install setuptools with pkg_resources (required by d4rl entry points)
+pip install "setuptools<81"
+
+# Install mjrl (required by d4rl locomotion environments)
+pip install git+https://github.com/aravindr93/mjrl.git
+
+# Install core dependencies
+pip install torch>=2.0 numpy scipy scikit-learn tqdm
+
+# Install D4RL (after mjrl)
+pip install d4rl
+
+# Install gym version compatible with D4RL
+pip install "gym==0.21.0"
+
+# Set library path for NVIDIA drivers (WSL/Linux)
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
+
+# Avoid fragmentation OOM in D-TRAK (recommended)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+---
+
+## Quick Start
+
+### Smoke Test (~15 minutes, 1 GPU)
+
+```bash
+python run_grid.py --smoke-test
+```
+
+### Single Cell Run
+
+```bash
+python run_experiments.py \
+    --env halfcheetah \
+    --dataset medium \
+    --experiment all \
+    --seed 0
+```
+
+### Full Grid (9 cells x 3 seeds = 27 runs)
+
+```bash
+# Sequential (1 GPU):
+python run_grid.py --experiments all
+
+# Parallel (4 GPUs):
+python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3
+
+# With resume (skip completed cells):
+python run_grid.py --experiments all --mode parallel --n-workers 4 --gpu-ids 0 1 2 3 --resume
+```
+
+---
+
+## Reproducing the Paper
+
+### Full Experiment Pipeline
+
+```bash
+# Set environment variables (optional, defaults to ./analysis and ./checkpoints)
+export DADIFFCTRL_RESULTS_DIR=/path/to/analysis
+export DADIFFCTRL_CHECKPOINT_DIR=/path/to/checkpoints
+
+# Run all experiments
+bash run_all.sh
+```
+
+Or step by step:
+
+```bash
+# 1. Main grid: all 9 cells x 3 seeds, all experiments
+python run_grid.py --experiments all --mode parallel --n-workers 12 --gpu-ids 0 1 2 3 4 5 6 7 8 9 10 11
+
+# 2. Hessian ablation (EK-FAC vs K-FAC vs diagonal vs plain-dot)
+python run_ablation.py
+
+# 3. Aggregate results and output LaTeX tables
+python aggregate_results.py --latex --output analysis/aggregated.json
+```
+
+### Expected Output
+
+After running, you'll have:
+- `analysis/{env}_{dataset}_seed{seed}_all_ekfac_{timestamp}.json` — per-cell results
+- `analysis/ablation_hessian_{timestamp}.json` — ablation results
+- `analysis/aggregated.json` — mean +/- std across seeds
+- `analysis/failed_cells.json` — any failed runs (for retry)
+
+---
+
+## Computing Influence Scores
 
 ```python
 import torch
-from configs import ExperimentConfig, InfluenceConfig
-from diffuser_minimal import GaussianDiffusion, TemporalUNet, TrajectoryDataset, train, plan
+from configs import ExperimentConfig
+from diffuser_minimal import TrajectoryDataset, train, plan
 from influence_functions import TrajectoryInfluenceComputer
 
 # 1. Set up configuration
@@ -89,103 +176,17 @@ print(f"Top 5 most harmful training indices: {scores.argsort()[:5]}")
 
 ---
 
-## Reproducing Paper Results
-
-All paper experiments can be reproduced using `run_experiments.py`:
-
-### T-LDS Experiment (Table 1)
-
-```bash
-# Run across all 9 environments (3 envs x 3 datasets)
-for env in halfcheetah hopper walker2d; do
-  for dataset in medium medium-replay medium-expert; do
-    python run_experiments.py \
-      --env $env \
-      --dataset $dataset \
-      --experiment lds \
-      --hessian-approx ekfac \
-      --seed 0
-  done
-done
-```
-
-### Safety Attribution (Table 2)
-
-```bash
-for env in halfcheetah hopper walker2d; do
-  for dataset in medium medium-replay medium-expert; do
-    python run_experiments.py \
-      --env $env \
-      --dataset $dataset \
-      --experiment safety \
-      --proxy-type constraint_satisfaction \
-      --seed 0
-  done
-done
-```
-
-### Data Curation (Table 3)
-
-```bash
-for env in halfcheetah hopper walker2d; do
-  for dataset in medium medium-replay medium-expert; do
-    python run_experiments.py \
-      --env $env \
-      --dataset $dataset \
-      --experiment curation \
-      --seed 0
-  done
-done
-```
-
-### Ablation: Hessian Approximation (Table 4)
-
-```bash
-for approx in diagonal kfac ekfac; do
-  python run_experiments.py \
-    --env halfcheetah \
-    --dataset medium \
-    --experiment lds \
-    --hessian-approx $approx \
-    --seed 0
-done
-```
-
-### Quick Smoke Test
-
-```bash
-# Debug mode: tiny model, few steps, small dataset (~2 min on GPU)
-python run_experiments.py --env halfcheetah --dataset medium --experiment lds --debug
-```
-
-### Multi-Seed Runs
-
-To reproduce the mean +/- std results reported in the paper, run each experiment with seeds 0, 1, 2:
-
-```bash
-for seed in 0 1 2; do
-  python run_experiments.py \
-    --env halfcheetah \
-    --dataset medium \
-    --experiment all \
-    --seed $seed
-done
-```
-
-Results are saved as JSON files in `Experiment/analysis/`.
-
----
-
 ## Key Configuration Options
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--env` | `halfcheetah` | D4RL environment: halfcheetah, hopper, walker2d |
 | `--dataset` | `medium` | Dataset variant: medium, medium-replay, medium-expert |
-| `--experiment` | `lds` | Experiment: lds, safety, curation, all |
-| `--hessian-approx` | `ekfac` | Hessian approximation: ekfac, kfac, diagonal |
-| `--proxy-type` | `likelihood` | Proxy measurement: likelihood, reward_conditioned, constraint_satisfaction, return |
+| `--experiment` | `lds` | Experiment: lds, safety, curation, intervention, all |
+| `--hessian-approx` | `ekfac` | Hessian approximation: ekfac, kfac, diagonal, plain_dot |
+| `--proxy-type` | `likelihood` | Proxy: likelihood, reward_conditioned, constraint_satisfaction, conditioning_gap |
 | `--seed` | `0` | Random seed |
+| `--smoke-test` | `false` | Minimal end-to-end validation |
 | `--debug` | `false` | Tiny config for quick testing |
 | `--checkpoint` | `None` | Path to pre-trained model checkpoint |
 
@@ -193,6 +194,34 @@ See `configs.py` for the full set of configurable hyperparameters.
 
 ---
 
+## Known Caveats
+
+- **D-TRAK GPU memory**: The random projection matrix for D-TRAK with `projection_dim=1024` consumes ~37GB in fp16. Use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
+- **LDS subset_fraction**: We use `subset_fraction=0.5` following the TRAK convention.
+- **Safety threshold**: Unsafe trajectories are labeled at the 95th percentile of state constraint values (top 5% marked unsafe).
+- **Intervention rollouts**: MPC-style replanning every `horizon=32` steps.
+
+## Hardware Requirements
+
+- **GPU memory**: ~47GB per process recommended (A6000, A100)
+- **System RAM**: ~40GB per concurrent worker
+- **Wall-clock time**: ~3 days for full 9-env x 3-seed grid on 2 GPUs
+
+---
+
+## Citation
+
+```bibtex
+@inproceedings{tif2026,
+  title={Trajectory Influence Functions for Diffusion-Based Control},
+  author={[Authors]},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2026}
+}
+```
+
+---
+
 ## License
 
-MIT License (placeholder -- to be finalized upon publication).
+MIT License (placeholder — to be finalized upon publication).

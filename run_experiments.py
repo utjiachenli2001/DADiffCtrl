@@ -26,6 +26,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -78,7 +79,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("run_experiments")
 
-RESULTS_DIR = "/mnt/sdb/ljc/DADiffCtrl/analysis"
+RESULTS_DIR = os.environ.get("DADIFFCTRL_RESULTS_DIR", "./analysis")
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +571,10 @@ def run_safety_experiment(
     )
     dtrak_baseline.precompute_training_features(max_samples=n_scores)
     dtrak_scores_safety = dtrak_baseline.compute_scores(ref_plan_tensor)[:n_scores]
+    dtrak_baseline.cleanup()
     del dtrak_baseline
     torch.cuda.empty_cache()
+    gc.collect()
 
     # Build scores dict: only include methods evaluated on the same unsafe plan.
     # Drop "TIF (ours)" from main() since it was computed on the original ref_plan,
@@ -845,6 +848,42 @@ def main() -> None:
     influence_scores["TIF (ours)"] = tif_scores
     logger.info("TIF computed in %.1f seconds.", time.time() - t0)
 
+    # Free EK-FAC memory before computing Diagonal IF
+    del tic
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # --- Diagonal IF baseline (paper Table 2) ---
+    # Only if main approx is ekfac; skip if already diagonal
+    if config.influence.hessian_approx != "diagonal":
+        logger.info("Computing Diagonal IF baseline...")
+        t0_diag = time.time()
+        diag_config = InfluenceConfig(
+            hessian_approx="diagonal",
+            damping=config.influence.damping,
+            n_eigenvectors=config.influence.n_eigenvectors,
+            proxy_type=config.influence.proxy_type,
+            gradient_batch_size=config.influence.gradient_batch_size,
+            device=config.influence.device,
+        )
+        tic_diag = TrajectoryInfluenceComputer(
+            model=diffusion,
+            dataset=dataset,
+            config=diag_config,
+            diffusion_steps=config.diffuser.n_diffusion_steps,
+        )
+        tic_diag.compute_hessian_approximation(n_samples=max_inf_samples)
+        diag_scores = tic_diag.compute_all_influences_batched(
+            plan_tau=ref_plan_tensor,
+            proxy_type=diag_config.proxy_type,
+            max_samples=max_inf_samples,
+        )
+        influence_scores["DiagonalIF"] = diag_scores
+        logger.info("DiagonalIF computed in %.1f seconds.", time.time() - t0_diag)
+        del tic_diag
+        torch.cuda.empty_cache()
+        gc.collect()
+
     # Determine effective number of samples for all methods
     n_effective = max_inf_samples if max_inf_samples else len(dataset)
     n_effective = min(n_effective, len(dataset))
@@ -881,8 +920,10 @@ def main() -> None:
     influence_scores["TRAK (1-ckpt)"] = dtrak_scores
     logger.info("TRAK (1-ckpt) computed in %.1f seconds.", time.time() - t0)
     # Free the 37GB GPU projection matrix before downstream stages
+    dtrak.cleanup()
     del dtrak
     torch.cuda.empty_cache()
+    gc.collect()
 
     # ---------------------------------------------------------------
     # 5. Run experiments

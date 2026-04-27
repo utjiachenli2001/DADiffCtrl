@@ -5,6 +5,7 @@ Centralizes hyperparameters for the Diffuser model, influence computation,
 evaluation protocols, and D4RL environment specifications.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -47,12 +48,17 @@ DATASET_VARIANTS: List[str] = [
     "expert",
 ]
 
-# Default grid for multi-cell experiments
+# Default grid for multi-cell experiments (Table 2: all 9 cells)
 GRID_CELLS: List[Tuple[str, str]] = [
     ("halfcheetah", "medium"),
-    ("hopper", "medium"),
-    ("walker2d", "medium"),
+    ("halfcheetah", "medium-replay"),
     ("halfcheetah", "medium-expert"),
+    ("hopper", "medium"),
+    ("hopper", "medium-replay"),
+    ("hopper", "medium-expert"),
+    ("walker2d", "medium"),
+    ("walker2d", "medium-replay"),
+    ("walker2d", "medium-expert"),
 ]
 
 GRID_SEEDS: List[int] = [0, 1, 2]
@@ -233,11 +239,19 @@ class ExperimentConfig:
     dtrak: DTRAKConfig = field(default_factory=DTRAKConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
-    # Where to save results
-    results_dir: str = "/mnt/sdb/ljc/DADiffCtrl/analysis"
+    # Where to save results (env override: DADIFFCTRL_RESULTS_DIR)
+    results_dir: str = field(
+        default_factory=lambda: os.environ.get(
+            "DADIFFCTRL_RESULTS_DIR", "./analysis"
+        )
+    )
 
-    # Checkpoint directory
-    checkpoint_dir: str = "/mnt/sdb/ljc/DADiffCtrl/checkpoints"
+    # Checkpoint directory (env override: DADIFFCTRL_CHECKPOINT_DIR)
+    checkpoint_dir: str = field(
+        default_factory=lambda: os.environ.get(
+            "DADIFFCTRL_CHECKPOINT_DIR", "./checkpoints"
+        )
+    )
 
     def __post_init__(self) -> None:
         """Propagate environment dimensions into diffuser config."""

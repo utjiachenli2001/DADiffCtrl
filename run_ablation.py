@@ -46,8 +46,8 @@ from evaluation import save_results
 logger = logging.getLogger("run_ablation")
 
 HESSIAN_MODES = ["ekfac", "kfac", "diagonal", "plain_dot"]
-RESULTS_DIR = "/mnt/sdb/ljc/DADiffCtrl/analysis"
-CHECKPOINT_BASE = "/mnt/sdb/ljc/DADiffCtrl/checkpoints"
+RESULTS_DIR = os.environ.get("DADIFFCTRL_RESULTS_DIR", "./analysis")
+CHECKPOINT_BASE = os.environ.get("DADIFFCTRL_CHECKPOINT_DIR", "./checkpoints")
 
 
 def build_config(
